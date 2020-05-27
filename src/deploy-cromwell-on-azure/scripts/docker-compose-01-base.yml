@@ -4,14 +4,13 @@
 version: "3.6"
 services:
   tes:
-    image: "TESIMAGENAME"
     environment:
-      - DefaultStorageAccountName=STORAGEACCOUNTNAME
-      - CosmosDbAccountName=COSMOSDBNAME
-      - BatchAccountName=VARBATCHACCOUNTNAME
-      - ApplicationInsightsAccountName=VARAPPLICATIONINSIGHTSACCOUNTNAME
-      - UsePreemptibleVmsOnly=false
-      - AzureOfferDurableId=MS-AZR-0003p
+      - DefaultStorageAccountName=$DefaultStorageAccountName
+      - CosmosDbAccountName=$CosmosDbAccountName
+      - BatchAccountName=$BatchAccountName
+      - ApplicationInsightsAccountName=$ApplicationInsightsAccountName
+      - UsePreemptibleVmsOnly=$UsePreemptibleVmsOnly
+      - AzureOfferDurableId=$AzureOfferDurableId
     expose:
       - "80"
     volumes:
@@ -20,7 +19,7 @@ services:
         target: /cromwell-tmp
     restart: unless-stopped
   mysqldb:
-    image: "mysql:latest"
+    image: "mysql:8.0.20"
     environment:
       - MYSQL_ROOT_PASSWORD=cromwell
       - MYSQL_DATABASE=cromwell_db
@@ -36,7 +35,7 @@ services:
       - "3306"
     restart: unless-stopped
   cromwell:
-    image: "CROMWELLIMAGENAME"
+    image: "broadinstitute/cromwell:50"
     volumes:
       - type: bind
         source: /cromwellazure/wait-for-it
@@ -55,11 +54,9 @@ services:
       - "tes"
     restart: unless-stopped
   triggerservice:
-    image: "TRIGGERSERVICEIMAGENAME"
     environment:
-      - DefaultStorageAccountName=STORAGEACCOUNTNAME
-      - LAB_NAME=lab1
-      - ApplicationInsightsAccountName=VARAPPLICATIONINSIGHTSACCOUNTNAME
+      - DefaultStorageAccountName=$DefaultStorageAccountName
+      - ApplicationInsightsAccountName=$ApplicationInsightsAccountName
     depends_on:
       - "cromwell"
     restart: unless-stopped

@@ -467,16 +467,28 @@ namespace CromwellOnAzureDeployer
                 triggerServiceImageName = await LoadCustomDockerImageAsync(configuration.CustomTriggerServiceImagePath);
             }
 
-            var dockerComposeConfigText = ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose.yml"))
-                .Replace("STORAGEACCOUNTNAME", configuration.StorageAccountName)
-                .Replace("COSMOSDBNAME", configuration.CosmosDbAccountName)
-                .Replace("VARBATCHACCOUNTNAME", configuration.BatchAccountName)
-                .Replace("VARAPPLICATIONINSIGHTSACCOUNTNAME", configuration.ApplicationInsightsAccountName)
-                .Replace("TESIMAGENAME", tesImageName)
-                .Replace("CROMWELLIMAGENAME", cromwellImageName)
-                .Replace("TRIGGERSERVICEIMAGENAME", triggerServiceImageName);
+            // TODO Update: Delete docker-compose.yml if it exists
+            // These goto to docker-compose-03-resource-names.yml, only on initial deployment
+            //var dockerComposeConfigText = ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose.yml"))
+            //    .Replace("STORAGEACCOUNTNAME", configuration.StorageAccountName)
+            //    .Replace("COSMOSDBNAME", configuration.CosmosDbAccountName)
+            //    .Replace("VARBATCHACCOUNTNAME", configuration.BatchAccountName)
+            //    .Replace("VARAPPLICATIONINSIGHTSACCOUNTNAME", configuration.ApplicationInsightsAccountName)
+            //    .Replace("TESIMAGENAME", tesImageName)
+            //    .Replace("CROMWELLIMAGENAME", cromwellImageName)
+            //    .Replace("TRIGGERSERVICEIMAGENAME", triggerServiceImageName);
 
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, dockerComposeConfigText, "/cromwellazure/docker-compose.yml", false);
+  //          var x = @"services:
+  //tes:
+  //  environment:
+  //    - DefaultStorageAccountName=STORAGEACCOUNTNAME
+  //    - CosmosDbAccountName=COSMOSDBNAME
+  //    - BatchAccountName=VARBATCHACCOUNTNAME
+  //    - ApplicationInsightsAccountName=VARAPPLICATIONINSIGHTSACCOUNTNAME
+  //    - UsePreemptibleVmsOnly=false
+  //    - AzureOfferDurableId=MS-AZR-0003p"
+
+            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose-01-base.yml")), "/cromwellazure/docker-compose.yml", false);
         }
 
         private Task RestartVmAsync(IVirtualMachine linuxVm)

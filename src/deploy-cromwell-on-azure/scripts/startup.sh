@@ -15,25 +15,32 @@ function write_log() {
     echo ${1+$(date --iso-8601=seconds) $1}
 }
 
+storage_account_name=$(grep -Po "(?<=DefaultStorageAccountName=).*$" .env)
+
 write_log "CromwellOnAzure startup log"
 write_log
 
 write_log "mount_containers.sh:"
 cd /cromwellazure
-./mount_containers.sh -a STORAGEACCOUNTNAME
+./mount_containers.sh -a $storage_account_name
 write_log
 
 write_log "Mounted blobfuse containers:"
 findmnt -t fuse
 write_log
 
-write_log "docker-compose pull:"
-docker-compose pull --ignore-pull-failures
+docker_compose_files=(docker-compose-*.yml)
+docker_compose_file_args="$(printf -- "-f \"%s\" " "${docker_compose_files[@]}")"
+docker_compose_pull_command="docker-compose $docker_compose_file_args pull --ignore-pull-failures"
+docker_compose_up_command="docker-compose $docker_compose_file_args up -d"
+
+write_log "Running $docker_compose_pull_command"
+eval $docker_compose_pull_command
 write_log
 
-write_log "docker-compose up:"
+write_log "Running $docker_compose_up_command"
 mkdir -p /cromwellazure/cromwell-tmp
-docker-compose -f /cromwellazure/docker-compose.yml -f /cromwellazure/docker-compose.override.yml up -d
+eval $docker_compose_up_command
 write_log
 
 write_log "Startup complete"
