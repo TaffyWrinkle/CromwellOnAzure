@@ -1,9 +1,0 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
-
-version: "3.6"
-services:
-  tes:
-    image: "mcr.microsoft.com/cromwellonazure/tes:{BUILD_ID}"
-  triggerservice:
-    image: "mcr.microsoft.com/cromwellonazure/triggerservice:{BUILD_ID}"

@@ -30,9 +30,9 @@ namespace CromwellOnAzureDeployer
         public string VmName { get; set; }
         public bool Silent { get; set; }
         public bool DeleteResourceGroupOnFailure { get; set; }
-        public string CromwellImageName { get; set; } = "broadinstitute/cromwell:50";
-        public string TesImageName { get; set; } = "mcr.microsoft.com/cromwellonazure/tes:1";
-        public string TriggerServiceImageName { get; set; } = "mcr.microsoft.com/cromwellonazure/triggerservice:1";
+        public string CromwellVersion { get; set; }
+        public string TesImageName { get; set; }
+        public string TriggerServiceImageName { get; set; }
         public string CustomCromwellImagePath { get; set; }
         public string CustomTesImagePath { get; set; }
         public string CustomTriggerServiceImagePath { get; set; }

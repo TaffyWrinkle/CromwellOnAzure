@@ -2,7 +2,7 @@
   "profiles": {
     "Setup": {
       "commandName": "Project",
-      "commandLineArgs": "--subscriptionid aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee --regionname westus2 --mainidentifierprefix coatest"
+      "commandLineArgs": "--subscriptionid f483a450-5f19-4b20-9326-b5852bb89d83 --regionname southcentralus --mainidentifierprefix coaabendise --VmPassword Gen0mics2019! --TesImageName mcr.microsoft.com/cromwellonazure/tes:1 --TriggerServiceImageName mcr.microsoft.com/cromwellonazure/triggerservice:1"
     }
   }
 }

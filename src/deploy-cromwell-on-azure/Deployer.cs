@@ -33,17 +33,24 @@ using Microsoft.Azure.Storage.Blob;
 using Microsoft.Rest;
 using Microsoft.Rest.Azure.OData;
 using Newtonsoft.Json;
+using Polly;
+using Polly.Retry;
 using Renci.SshNet;
 
 namespace CromwellOnAzureDeployer
 {
     public class Deployer
     {
+        private static readonly AsyncRetryPolicy roleAssignmentHashConflictRetryPolicy = Policy
+            .Handle<Microsoft.Rest.Azure.CloudException>(cloudException => cloudException.Body.Code.Equals("HashConflictOnDifferentRoleAssignmentIds"))
+            .RetryAsync();
+
         private const string WorkflowsContainerName = "workflows";
         private const string ConfigurationContainerName = "configuration";
         private const string InputsContainerName = "inputs";
+        private const string CromwellAzureRootDir = "/data/cromwellazure";
 
-        private readonly TimeSpan azurePropagationDelay = TimeSpan.FromMinutes(5);
+        private readonly TimeSpan azurePropagationDelay = TimeSpan.FromMinutes(1);
         private readonly CancellationTokenSource cts = new CancellationTokenSource();
 
         private readonly List<string> requiredResourceProviders = new List<string>
@@ -141,12 +148,17 @@ namespace CromwellOnAzureDeployer
                 await AssignVmAsContributorToStorageAccountAsync(vmManagedIdentity, storageAccount);
                 await AssignVmAsDataReaderToStorageAccountAsync(vmManagedIdentity, storageAccount);
 
-                await DelayAsync(
-                    $"Waiting ({azurePropagationDelay.TotalMinutes:n0}) minutes for Azure to fully propagate role assignments...",
-                    azurePropagationDelay);
+                await DelayAsync($"Waiting {azurePropagationDelay.TotalMinutes:n0} minutes for Azure to fully propagate role assignments...", azurePropagationDelay);
 
                 await RestartVmAsync(linuxVm);
                 await WaitForSshConnectivityAsync(sshConnectionInfo);
+
+                if (! await IsStartupSuccessfulAsync(sshConnectionInfo))
+                {
+                    RefreshableConsole.WriteLine($"Startup script on the VM failed. Check {CromwellAzureRootDir}/startup.log for details", ConsoleColor.Red);
+                    return false;
+                }
+
                 await WaitForDockerComposeAsync(sshConnectionInfo);
                 await WaitForCromwellAsync(sshConnectionInfo);
 
@@ -194,15 +206,9 @@ namespace CromwellOnAzureDeployer
             return isDeploymentSuccessful;
         }
 
-        private async Task DelayAsync(string message, TimeSpan duration)
+        private Task DelayAsync(string message, TimeSpan duration)
         {
-            await Execute(
-                message,
-                async () =>
-                {
-                    await Task.Delay(duration);
-                    return Task.FromResult(false);
-                });
+            return Execute(message, () => Task.Delay(duration));
         }
 
         private Task WaitForSshConnectivityAsync(ConnectionInfo sshConnectionInfo)
@@ -238,8 +244,6 @@ namespace CromwellOnAzureDeployer
 
                         break;
                     }
-
-                    return Task.FromResult(false);
                 });
         }
 
@@ -251,7 +255,7 @@ namespace CromwellOnAzureDeployer
                 {
                     while (!cts.IsCancellationRequested)
                     {
-                        var (numberOfRunningContainers, _, _) = await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, "sudo docker ps -a | grep -c 'Up '", false);
+                        var (numberOfRunningContainers, _, _) = await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, "sudo docker ps -a | grep -c 'Up ' || :");
 
                         if (numberOfRunningContainers == "4")
                         {
@@ -260,8 +264,6 @@ namespace CromwellOnAzureDeployer
 
                         await Task.Delay(5000, cts.Token);
                     }
-
-                    return Task.FromResult(false);
                 });
         }
 
@@ -282,8 +284,33 @@ namespace CromwellOnAzureDeployer
 
                         await Task.Delay(5000, cts.Token);
                     }
+                });
+        }
 
-                    return Task.FromResult(false);
+        private Task<bool> IsStartupSuccessfulAsync(ConnectionInfo sshConnectionInfo)
+        {
+            return Execute(
+                "Waiting for startup script completion...",
+                async () =>
+                {
+                    while (!cts.IsCancellationRequested)
+                    {
+                        var (startupLogContent, _, _) = await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"cat {CromwellAzureRootDir}/startup.log || echo ''");
+
+                        if (startupLogContent.Contains("Startup complete"))
+                        {
+                            return true;
+                        }
+
+                        if (startupLogContent.Contains("Startup failed"))
+                        {
+                            return false;
+                        }
+
+                        await Task.Delay(5000, cts.Token);
+                    }
+
+                    return false;
                 });
         }
 
@@ -338,8 +365,6 @@ namespace CromwellOnAzureDeployer
 
                             await Task.Delay(TimeSpan.FromSeconds(15));
                         }
-
-                        return Task.FromResult(false);
                     });
             }
             catch (Microsoft.Rest.Azure.CloudException ex) when (ex.ToCloudErrorType() == CloudErrorType.AuthorizationFailed)
@@ -377,118 +402,109 @@ namespace CromwellOnAzureDeployer
 
         private async Task ConfigureVmAsync(ConnectionInfo sshConnectionInfo)
         {
-            await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, "sudo mkdir /cromwellazure && sudo chown vmadmin /cromwellazure && sudo chmod ug=rwx,o= /cromwellazure");
-            await CopyInstallationFilesAsync(sshConnectionInfo);
-            await Task.WhenAll(new[] { RunInstallationScriptAsync(sshConnectionInfo), CopyAnyCustomDockerImagesToTheVmAsync(sshConnectionInfo) });
-            await LoadAnyCustomDockerImagesAndCopyDockerComposeFileAsync(sshConnectionInfo);
+            await MountDataDiskOnTheVirtualMachineAsync(sshConnectionInfo);
+            await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"sudo mkdir -p {CromwellAzureRootDir} && sudo chown vmadmin {CromwellAzureRootDir} && sudo chmod ug=rwx,o= {CromwellAzureRootDir}");
+            await CopyNonPersonalizedFilesToVmAsync(sshConnectionInfo);
+            await RunInstallationScriptAsync(sshConnectionInfo);
+            await HandleCustomImagesAsync(sshConnectionInfo);
+            await CopyPersonalizedFilesToVmAsync(sshConnectionInfo);
         }
 
-        private async Task CopyInstallationFilesAsync(ConnectionInfo sshConnectionInfo)
+        private Task MountDataDiskOnTheVirtualMachineAsync(ConnectionInfo sshConnectionInfo)
         {
-            var startTime = DateTime.UtcNow;
-            var line = RefreshableConsole.WriteLine("Copying installation files to the VM...");
-
-            var startupText = ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "startup.sh")).Replace("STORAGEACCOUNTNAME", configuration.StorageAccountName);
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, startupText, "/cromwellazure/startup.sh", true);
-
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "wait-for-it.sh")), "/cromwellazure/wait-for-it/wait-for-it.sh", true);
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "install-cromwellazure.sh")), "/cromwellazure/install-cromwellazure.sh", true);
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "mount_containers.sh")), "/cromwellazure/mount_containers.sh", true);
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "cromwellazure.service")), "/lib/systemd/system/cromwellazure.service", false);
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "mount.blobfuse")), "/usr/sbin/mount.blobfuse", true);
-
-            WriteExecutionTime(line, startTime);
+            return Execute(
+                $"Mounting data disk to the VM...",
+                async () =>
+                {
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "mount-data-disk.sh")), $"/tmp/mount-data-disk.sh", true);
+                    await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"/tmp/mount-data-disk.sh");
+                });
         }
 
-        private async Task RunInstallationScriptAsync(ConnectionInfo sshConnectionInfo)
+        private Task CopyNonPersonalizedFilesToVmAsync(ConnectionInfo sshConnectionInfo)
         {
-            var startTime = DateTime.UtcNow;
-            var line = RefreshableConsole.WriteLine("Running installation script on the VM...");
-            await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"/cromwellazure/install-cromwellazure.sh");
-            WriteExecutionTime(line, startTime);
+            return Execute(
+                $"Copying files to the VM...",
+                async () =>
+                {
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "startup.sh")), $"{CromwellAzureRootDir}/startup.sh", true);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "wait-for-it.sh")), $"{CromwellAzureRootDir}/wait-for-it/wait-for-it.sh", true);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "install-cromwellazure.sh")), $"{CromwellAzureRootDir}/install-cromwellazure.sh", true);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "mount_containers.sh")), $"{CromwellAzureRootDir}/mount_containers.sh", true);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "env-02-internal-images.txt")), $"{CromwellAzureRootDir}/env-02-internal-images.txt", false);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "env-03-external-images.txt")), $"{CromwellAzureRootDir}/env-03-external-images.txt", false);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose.yml")), $"{CromwellAzureRootDir}/docker-compose.yml", false);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "cromwellazure.service")), "/lib/systemd/system/cromwellazure.service", false);
+                    await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "mount.blobfuse")), "/usr/sbin/mount.blobfuse", true);
+                });
         }
 
-        private async Task CopyAnyCustomDockerImagesToTheVmAsync(ConnectionInfo sshConnectionInfo)
+        private Task RunInstallationScriptAsync(ConnectionInfo sshConnectionInfo)
+        {
+            return Execute(
+                $"Running installation script on the VM...",
+                () => ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"{CromwellAzureRootDir}/install-cromwellazure.sh"));
+        }
+
+        private async Task CopyPersonalizedFilesToVmAsync(ConnectionInfo sshConnectionInfo)
+        {
+            await UploadFileToVirtualMachineAsync(
+                sshConnectionInfo, 
+                ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "env-01-account-names.txt"))
+                    .Replace("{DefaultStorageAccountName}", configuration.StorageAccountName)
+                    .Replace("{CosmosDbAccountName}", configuration.CosmosDbAccountName)
+                    .Replace("{BatchAccountName}", configuration.BatchAccountName)
+                    .Replace("{ApplicationInsightsAccountName}", configuration.ApplicationInsightsAccountName), 
+                $"{CromwellAzureRootDir}/env-01-account-names.txt", 
+                false);
+
+            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "env-04-settings.txt")), $"{CromwellAzureRootDir}/env-04-settings.txt", false);
+        }
+
+        private async Task HandleCustomImagesAsync(ConnectionInfo sshConnectionInfo)
+        {
+            await HandleCustomImageAsync(sshConnectionInfo, configuration.CromwellVersion, configuration.CustomCromwellImagePath, "env-05-custom-cromwell-image-name.txt", "CromwellImageName", cromwellVersion => $"broadinstitute/cromwell:{cromwellVersion}");
+            await HandleCustomImageAsync(sshConnectionInfo, configuration.TesImageName, configuration.CustomTesImagePath, "env-06-custom-tes-image-name.txt", "TesImageName");
+            await HandleCustomImageAsync(sshConnectionInfo, configuration.TriggerServiceImageName, configuration.CustomTriggerServiceImagePath, "env-07-custom-trigger-service-image-name.txt", "TriggerServiceImageName");
+        }
+
+        private async Task HandleCustomImageAsync(ConnectionInfo sshConnectionInfo, string imageNameOrTag, string customImagePath, string envFileName, string envFileKey, Func<string, string> imageNameFactory = null)
         {
             async Task CopyCustomDockerImageAsync(string customImagePath)
             {
                 var startTime = DateTime.UtcNow;
                 var line = RefreshableConsole.WriteLine($"Copying custom image from {customImagePath} to the VM...");
-                var remotePath = $"/cromwellazure/{Path.GetFileName(customImagePath)}";
+                var remotePath = $"{CromwellAzureRootDir}/{Path.GetFileName(customImagePath)}";
                 await UploadFileToVirtualMachineAsync(sshConnectionInfo, File.OpenRead(customImagePath), remotePath, false);
                 WriteExecutionTime(line, startTime);
             }
 
-            if (!string.IsNullOrEmpty(configuration.CustomTesImagePath))
-            {
-                await CopyCustomDockerImageAsync(configuration.CustomTesImagePath);
-            }
-
-            if (!string.IsNullOrEmpty(configuration.CustomCromwellImagePath))
-            {
-                await CopyCustomDockerImageAsync(configuration.CustomCromwellImagePath);
-            }
-
-            if (!string.IsNullOrEmpty(configuration.CustomTriggerServiceImagePath))
-            {
-                await CopyCustomDockerImageAsync(configuration.CustomTriggerServiceImagePath);
-            }
-        }
-
-        private async Task LoadAnyCustomDockerImagesAndCopyDockerComposeFileAsync(ConnectionInfo sshConnectionInfo)
-        {
             async Task<string> LoadCustomDockerImageAsync(string customImagePath)
             {
                 var startTime = DateTime.UtcNow;
-                var line = RefreshableConsole.WriteLine($"Loading custom image on the VM...");
-                var remotePath = $"/cromwellazure/{Path.GetFileName(customImagePath)}";
+                var line = RefreshableConsole.WriteLine($"Loading custom image {customImagePath} on the VM...");
+                var remotePath = $"{CromwellAzureRootDir}/{Path.GetFileName(customImagePath)}";
                 var (loadedImageName, _, _) = await ExecuteCommandOnVirtualMachineAsync(sshConnectionInfo, $"imageName=$(sudo docker load -i {remotePath}) && rm {remotePath} && imageName=$(expr \"$imageName\" : 'Loaded.*: \\(.*\\)') && echo $imageName");
                 WriteExecutionTime(line, startTime);
 
                 return loadedImageName;
             }
 
-            var tesImageName = configuration.TesImageName;
-            var cromwellImageName = configuration.CromwellImageName;
-            var triggerServiceImageName = configuration.TriggerServiceImageName;
-
-            if (!string.IsNullOrEmpty(configuration.CustomTesImagePath))
+            if (imageNameOrTag != null && imageNameOrTag.Equals(string.Empty))
             {
-                tesImageName = await LoadCustomDockerImageAsync(configuration.CustomTesImagePath);
+                await DeleteFileFromVirtualMachineAsync(sshConnectionInfo, $"{CromwellAzureRootDir}/{envFileName}");
             }
-
-            if (!string.IsNullOrEmpty(configuration.CustomCromwellImagePath))
+            else if (!string.IsNullOrEmpty(imageNameOrTag))
             {
-                cromwellImageName = await LoadCustomDockerImageAsync(configuration.CustomCromwellImagePath);
+                var actualImageName = imageNameFactory != null ? imageNameFactory(imageNameOrTag) : imageNameOrTag;
+                await UploadFileToVirtualMachineAsync(sshConnectionInfo, $"{envFileKey}={actualImageName}", $"{CromwellAzureRootDir}/{envFileName}", false);
             }
-
-            if (!string.IsNullOrEmpty(configuration.CustomTriggerServiceImagePath))
+            else if (!string.IsNullOrEmpty(customImagePath))
             {
-                triggerServiceImageName = await LoadCustomDockerImageAsync(configuration.CustomTriggerServiceImagePath);
+                await CopyCustomDockerImageAsync(customImagePath);
+                var loadedImageName = await LoadCustomDockerImageAsync(customImagePath);
+                await UploadFileToVirtualMachineAsync(sshConnectionInfo, $"{envFileKey}={loadedImageName}", $"{CromwellAzureRootDir}/{envFileName}", false);
             }
-
-            // TODO Update: Delete docker-compose.yml if it exists
-            // These goto to docker-compose-03-resource-names.yml, only on initial deployment
-            //var dockerComposeConfigText = ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose.yml"))
-            //    .Replace("STORAGEACCOUNTNAME", configuration.StorageAccountName)
-            //    .Replace("COSMOSDBNAME", configuration.CosmosDbAccountName)
-            //    .Replace("VARBATCHACCOUNTNAME", configuration.BatchAccountName)
-            //    .Replace("VARAPPLICATIONINSIGHTSACCOUNTNAME", configuration.ApplicationInsightsAccountName)
-            //    .Replace("TESIMAGENAME", tesImageName)
-            //    .Replace("CROMWELLIMAGENAME", cromwellImageName)
-            //    .Replace("TRIGGERSERVICEIMAGENAME", triggerServiceImageName);
-
-  //          var x = @"services:
-  //tes:
-  //  environment:
-  //    - DefaultStorageAccountName=STORAGEACCOUNTNAME
-  //    - CosmosDbAccountName=COSMOSDBNAME
-  //    - BatchAccountName=VARBATCHACCOUNTNAME
-  //    - ApplicationInsightsAccountName=VARAPPLICATIONINSIGHTSACCOUNTNAME
-  //    - UsePreemptibleVmsOnly=false
-  //    - AzureOfferDurableId=MS-AZR-0003p"
-
-            await UploadFileToVirtualMachineAsync(sshConnectionInfo, ReadAllTextWithUnixLineEndings(GetPathFromAppRelativePath("scripts", "docker-compose-01-base.yml")), "/cromwellazure/docker-compose.yml", false);
         }
 
         private Task RestartVmAsync(IVirtualMachine linuxVm)
@@ -498,7 +514,7 @@ namespace CromwellOnAzureDeployer
                 async () =>
                 {
                     await linuxVm.RestartAsync(cts.Token);
-                    return Task.FromResult(false);
+                    return Task.CompletedTask;
                 });
         }
 
@@ -509,24 +525,26 @@ namespace CromwellOnAzureDeployer
 
             return Execute(
                 $"Assigning Storage Blob Data Reader role for VM to Storage Account resource scope...",
-                () => azureClient.AccessManagement.RoleAssignments
-                    .Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithRoleDefinition(roleDefinitionId)
-                    .WithResourceScope(storageAccount)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithRoleDefinition(roleDefinitionId)
+                        .WithResourceScope(storageAccount)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task AssignVmAsContributorToStorageAccountAsync(string vmManagedIdentity, IResource storageAccount)
         {
             return Execute(
                 $"Assigning {BuiltInRole.Contributor} role for VM to Storage Account resource scope...",
-                () => azureClient.AccessManagement.RoleAssignments
-                    .Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithBuiltInRole(BuiltInRole.Contributor)
-                    .WithResourceScope(storageAccount)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithBuiltInRole(BuiltInRole.Contributor)
+                        .WithResourceScope(storageAccount)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task<IStorageAccount> CreateStorageAccountAsync()
@@ -559,7 +577,7 @@ namespace CromwellOnAzureDeployer
 
                     var containersToMountConfigPath = GetPathFromAppRelativePath("scripts", "containers-to-mount");
                     var containersToMountConfigText = ReadAllTextWithUnixLineEndings(containersToMountConfigPath);
-                    containersToMountConfigText = containersToMountConfigText.Replace("STORAGEACCOUNTNAME", configuration.StorageAccountName);
+                    containersToMountConfigText = containersToMountConfigText.Replace("{DefaultStorageAccountName}", configuration.StorageAccountName);
                     await configContainer.GetBlockBlobReference(Path.GetFileName(containersToMountConfigPath)).UploadTextAsync(containersToMountConfigText, cts.Token);
 
                     var workflowsContainer = blobClient.GetContainerReference(WorkflowsContainerName);
@@ -574,24 +592,26 @@ namespace CromwellOnAzureDeployer
         {
             return Execute(
                 $"Assigning {BuiltInRole.Contributor} role for VM to Batch Account resource scope...",
-                () => azureClient.AccessManagement.RoleAssignments
-                    .Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithBuiltInRole(BuiltInRole.Contributor)
-                    .WithScope(batchAccount.Id)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithBuiltInRole(BuiltInRole.Contributor)
+                        .WithScope(batchAccount.Id)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task AssignVmAsContributorToCosmosDb(string vmManagedIdentity, IResource cosmosDb)
         {
             return Execute(
                 $"Assigning {BuiltInRole.Contributor} role for VM to Cosmos DB resource scope...",
-                () => azureClient.AccessManagement.RoleAssignments
-                    .Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithBuiltInRole(BuiltInRole.Contributor)
-                    .WithResourceScope(cosmosDb)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithBuiltInRole(BuiltInRole.Contributor)
+                        .WithResourceScope(cosmosDb)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task<ICosmosDBAccount> CreateCosmosDbAsync()
@@ -612,23 +632,26 @@ namespace CromwellOnAzureDeployer
         {
             return Execute(
                 $"Assigning {BuiltInRole.BillingReader} role for VM to Subscription scope...",
-                () => azureClient.AccessManagement.RoleAssignments.Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithBuiltInRole(BuiltInRole.BillingReader)
-                    .WithSubscriptionScope(configuration.SubscriptionId)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithBuiltInRole(BuiltInRole.BillingReader)
+                        .WithSubscriptionScope(configuration.SubscriptionId)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task AssignVmAsContributorToAppInsightsAsync(string vmManagedIdentity, IResource appInsights)
         {
             return Execute(
                 $"Assigning {BuiltInRole.Contributor} role for VM to App Insights resource scope...",
-                () => azureClient.AccessManagement.RoleAssignments
-                    .Define(Guid.NewGuid().ToString())
-                    .ForObjectId(vmManagedIdentity)
-                    .WithBuiltInRole(BuiltInRole.Contributor)
-                    .WithResourceScope(appInsights)
-                    .CreateAsync(cts.Token));
+                () => roleAssignmentHashConflictRetryPolicy.ExecuteAsync(
+                    () => azureClient.AccessManagement.RoleAssignments
+                        .Define(Guid.NewGuid().ToString())
+                        .ForObjectId(vmManagedIdentity)
+                        .WithBuiltInRole(BuiltInRole.Contributor)
+                        .WithResourceScope(appInsights)
+                        .CreateAsync(cts.Token)));
         }
 
         private Task<IVirtualMachine> CreateVirtualMachineAsync()
@@ -1042,6 +1065,11 @@ namespace CromwellOnAzureDeployer
             }
         }
 
+        private Task Execute(string message, Func<Task> func)
+        {
+            return Execute(message, async () => { await func(); return false; });
+        }
+
         private async Task<T> Execute<T>(string message, Func<Task<T>> func)
         {
             const int retryCount = 3;
@@ -1084,11 +1112,11 @@ namespace CromwellOnAzureDeployer
             line.Write($" Completed in {DateTime.UtcNow.Subtract(startTime).TotalSeconds:n0}s", ConsoleColor.Green);
         }
 
-        private async Task<(string Output, string Error, int ExitStatus)> ExecuteCommandOnVirtualMachineAsync(ConnectionInfo sshConnectionInfo, string command, bool throwOnNonZeroExitCode = true)
+        private async Task<(string Output, string Error, int ExitStatus)> ExecuteCommandOnVirtualMachineAsync(ConnectionInfo sshConnectionInfo, string command)
         {
             using var sshClient = new SshClient(sshConnectionInfo);
             sshClient.ConnectWithRetries();
-            var (output, error, exitStatus) = await sshClient.ExecuteCommandAsync(command, throwOnNonZeroExitCode, cts.Token);
+            var (output, error, exitStatus) = await sshClient.ExecuteCommandAsync(command);
             sshClient.Disconnect();
 
             return (output, error, exitStatus);
@@ -1110,23 +1138,31 @@ namespace CromwellOnAzureDeployer
             sshClient.ConnectWithRetries();
 
             // Create destination directory if needed and make it writable for the current user
-            var (output, _, _) = await sshClient.ExecuteCommandAsync($"sudo mkdir -p {dir} && owner=$(stat -c '%U' {dir}) && mask=$(stat -c '%a' {dir}) && ownerCanWrite=$(( (16#$mask & 16#200) > 0 )) && othersCanWrite=$(( (16#$mask & 16#002) > 0 )) && ( [[ $owner == $(whoami) && $ownerCanWrite == 1 || $othersCanWrite == 1 ]] && echo 0 || ( sudo chmod o+w {dir} && echo 1 ))", true, cts.Token);
+            var (output, _, _) = await sshClient.ExecuteCommandAsync($"sudo mkdir -p {dir} && owner=$(stat -c '%U' {dir}) && mask=$(stat -c '%a' {dir}) && ownerCanWrite=$(( (16#$mask & 16#200) > 0 )) && othersCanWrite=$(( (16#$mask & 16#002) > 0 )) && ( [[ $owner == $(whoami) && $ownerCanWrite == 1 || $othersCanWrite == 1 ]] && echo 0 || ( sudo chmod o+w {dir} && echo 1 ))");
             var dirWasMadeWritableToOthers = output == "1";
 
             sftpClient.Connect();
-            await sftpClient.UploadFileAsync(input, remoteFilePath, true, cts.Token);
+            await sftpClient.UploadFileAsync(input, remoteFilePath, true);
             sftpClient.Disconnect();
 
             if (makeExecutable)
             {
-                await sshClient.ExecuteCommandAsync($"sudo chmod +x {remoteFilePath}", true, cts.Token);
+                await sshClient.ExecuteCommandAsync($"sudo chmod +x {remoteFilePath}");
             }
 
             if (dirWasMadeWritableToOthers)
             {
-                await sshClient.ExecuteCommandAsync($"sudo chmod o-w {dir}", true, cts.Token);
+                await sshClient.ExecuteCommandAsync($"sudo chmod o-w {dir}");
             }
 
+            sshClient.Disconnect();
+        }
+
+        private async Task DeleteFileFromVirtualMachineAsync(ConnectionInfo sshConnectionInfo, string filePath)
+        {
+            using var sshClient = new SshClient(sshConnectionInfo);
+            sshClient.ConnectWithRetries();
+            await sshClient.ExecuteCommandAsync($"sudo rm -f {filePath}");
             sshClient.Disconnect();
         }
 
