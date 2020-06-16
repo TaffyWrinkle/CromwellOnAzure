@@ -16,11 +16,11 @@ namespace CromwellOnAzureDeployer
         public string SubscriptionId { get; set; }
         public string RegionName { get; set; } = "westus";
         public string MainIdentifierPrefix { get; set; } = "coa";
-        public KnownLinuxVirtualMachineImage VmImage { get; set; } = KnownLinuxVirtualMachineImage.UbuntuServer16_04_Lts;
-        public string VmSize { get; set; } = "Standard_D2_v2";
+        public string VmOsVersion { get; set; } = "18.04-LTS";
+        public string VmSize { get; set; } = "Standard_D3_v2";
         public string VnetAddressSpace { get; set; } = "10.0.0.0/24";
         public string VmUsername { get; set; } = "vmadmin";
-        public string VmPassword { get; set; } = Utility.GeneratePassword();
+        public string VmPassword { get; set; }
         public string ResourceGroupName { get; set; }
         public string BatchAccountName { get; set; }
         public string StorageAccountName { get; set; }
@@ -36,7 +36,8 @@ namespace CromwellOnAzureDeployer
         public string CustomCromwellImagePath { get; set; }
         public string CustomTesImagePath { get; set; }
         public string CustomTriggerServiceImagePath { get; set; }
-        public bool RequireTestWorkflow { get; set; }
+        public bool? RunTestWorkflow { get; set; } = null;
+        public bool Update { get; set; } = false;
 
         public static Configuration BuildConfiguration(string[] args)
         {
@@ -70,40 +71,6 @@ namespace CromwellOnAzureDeployer
 
         private void SetDefaultsAndOverrides()
         {
-            if (string.IsNullOrWhiteSpace(ResourceGroupName))
-            {
-                ResourceGroupName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}-", 15);
-            }
-
-            if (string.IsNullOrWhiteSpace(BatchAccountName))
-            {
-                BatchAccountName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}", 15);
-            }
-
-            if (string.IsNullOrWhiteSpace(StorageAccountName))
-            {
-                StorageAccountName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}", 24);
-            }
-
-            if (string.IsNullOrWhiteSpace(NetworkSecurityGroupName))
-            {
-                NetworkSecurityGroupName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}", 15);
-            }
-
-            if (string.IsNullOrWhiteSpace(CosmosDbAccountName))
-            {
-                CosmosDbAccountName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}-", 15);
-            }
-
-            if (string.IsNullOrWhiteSpace(ApplicationInsightsAccountName))
-            {
-                ApplicationInsightsAccountName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}-", 15);
-            }
-
-            if (string.IsNullOrWhiteSpace(VmName))
-            {
-                VmName = SdkContext.RandomResourceName($"{MainIdentifierPrefix}-", 25);
-            }
         }
     }
 }
