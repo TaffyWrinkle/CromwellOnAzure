@@ -1240,7 +1240,7 @@ namespace CromwellOnAzureDeployer
                 catch (Microsoft.Rest.Azure.CloudException cloudException) when (cloudException.ToCloudErrorType() == CloudErrorType.ExpiredAuthenticationToken)
                 {
                 }
-                catch (OperationCanceledException ex) when (cts.Token.IsCancellationRequested)
+                catch (OperationCanceledException) when (cts.Token.IsCancellationRequested)
                 {
                     line.Write(" Cancelled", ConsoleColor.Red);
                     return await Task.FromCanceled<T>(cts.Token);
