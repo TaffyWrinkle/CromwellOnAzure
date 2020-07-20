@@ -1,2 +1,2 @@
 ﻿CromwellImageName=broadinstitute/cromwell:50
-MySqlImageName=mysql:8.0.20
+MySqlImageName=mysql:latest
