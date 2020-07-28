@@ -41,7 +41,7 @@ services:
     entrypoint:
       - /bin/sh
       - -c
-    command: ["echo \"CREATE USER 'cromwell'@'localhost' IDENTIFIED BY 'cromwell'; GRANT ALL PRIVILEGES ON cromwell_db.* TO 'cromwell'@'localhost' WITH GRANT OPTION; CREATE USER 'cromwell'@'%' IDENTIFIED BY 'cromwell'; GRANT ALL PRIVILEGES ON cromwell_db.* TO 'cromwell'@'%' WITH GRANT OPTION;\" > /docker-entrypoint-initdb.d/init_user.sql && docker-entrypoint.sh mysqld && echo \"Deleting change log lock table...\" && mysql -u cromwell -p cromwell -e \"DELETE FROM DATABASECHANGELOGLOCK;\""]
+    command: ["echo \"UPDATE DATABASECHANGELOGLOCK SET LOCKED=0, LOCKGRANTED=null, LOCKEDBY=null where ID=1;\" > /tmp/unlock.sql && echo \"CREATE USER 'cromwell'@'localhost' IDENTIFIED BY 'cromwell'; GRANT ALL PRIVILEGES ON cromwell_db.* TO 'cromwell'@'localhost' WITH GRANT OPTION; CREATE USER 'cromwell'@'%' IDENTIFIED BY 'cromwell'; GRANT ALL PRIVILEGES ON cromwell_db.* TO 'cromwell'@'%' WITH GRANT OPTION;\" > /docker-entrypoint-initdb.d/init_user.sql && docker-entrypoint.sh mysqld --init-file /tmp/unlock.sql"]
     expose:
       - "3306"
     restart: unless-stopped
